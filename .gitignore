@@ -1,0 +1,14 @@
+# Data
+data/
+
+# Checkpoints
+checkpoints/
+
+# temp
+test.ipynb
+#logs
+logs/
+
+preprocessing/__pycache__/
+model/__pycache__/
+utils/__pycache__/
