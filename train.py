@@ -146,7 +146,7 @@ def train_one_epoch(
         n_samples += bsz
 
         # update text của progress bar
-        pbar.set_postfix({"loss": loss.item()})
+        # pbar.set_postfix({"loss": loss.item()})
 
     return total_loss / max(1, n_samples)
 
@@ -196,7 +196,7 @@ def validate_one_epoch(
         total_loss += loss.item() * bsz
         n_samples += bsz
 
-        pbar.set_postfix({"loss": loss.item()})
+        # pbar.set_postfix({"loss": loss.item()})
 
     return total_loss / max(1, n_samples)
 
