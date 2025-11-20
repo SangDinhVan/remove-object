@@ -17,6 +17,19 @@ from utils.logger import setup_logger
 from utils.lr_scheduler import lr_scheduler
 
 
+# =========================
+#      PSNR FUNCTION
+# =========================
+def compute_psnr(pred: torch.Tensor, target: torch.Tensor, max_val: float = 1.0) -> torch.Tensor:
+    """
+    pred, target: tensor [B, C, H, W], giá trị thường trong [0,1]
+    max_val: giá trị max của pixel, nếu bạn để 0..255 thì max_val=255
+    """
+    mse = F.mse_loss(pred, target, reduction="mean")
+    psnr = 10 * torch.log10(max_val ** 2 / (mse + 1e-8))
+    return psnr
+
+
 def build_dataloaders(cfg_dataset: dict, cfg_train: dict):
 
     dataset = InpaintDataset.from_config(cfg_dataset)
@@ -71,6 +84,7 @@ def build_model(cfg_model: dict, device: str):
     model = model.to(device)
     return model, name
 
+
 def build_optimizer(cfg_train: dict, model: nn.Module):
     lr = cfg_train.get("lr", 1e-4)
     weight_decay = cfg_train.get("weight_decay", 0.0)
@@ -93,6 +107,7 @@ def build_optimizer(cfg_train: dict, model: nn.Module):
 
     return optimizer
 
+
 def train_one_epoch(
     model: nn.Module,
     model_name: str,
@@ -101,14 +116,19 @@ def train_one_epoch(
     device: str,
     epoch: int,
     num_epochs: int,
-) -> float:
+) -> Tuple[float, float]:
+    """
+    Trả về:
+      - avg_train_loss
+      - avg_train_psnr
+    """
     model.train()
     total_loss = 0.0
+    total_psnr = 0.0
     n_samples = 0
 
     l1_loss = nn.L1Loss()
 
-    # tqdm cho từng batch
     pbar = tqdm(loader, desc=f"Train Epoch {epoch+1}/{num_epochs}", leave=False)
     for batch in pbar:
         image = batch["image"].to(device)     # [B,3,H,W]
@@ -120,7 +140,6 @@ def train_one_epoch(
 
         optimizer.zero_grad()
 
-        # UNet vs MAT (sau này bạn đổi model_name vẫn dùng chung được)
         if model_name == "efficientnet_mat":
             style_dim = getattr(model, "style_dim", 256)
             z = torch.randn(image.size(0), style_dim, device=device)
@@ -128,7 +147,6 @@ def train_one_epoch(
         else:
             pred = model(inp)                 # [B,3,h,w]
 
-        # 🔥 Ép output về cùng size với target nếu lệch (512 vs 256…)
         if pred.shape[-2:] != target.shape[-2:]:
             pred = F.interpolate(
                 pred,
@@ -141,14 +159,20 @@ def train_one_epoch(
         loss.backward()
         optimizer.step()
 
+        # PSNR
+        with torch.no_grad():
+            psnr = compute_psnr(pred.detach(), target.detach(), max_val=1.0)
+
         bsz = image.size(0)
         total_loss += loss.item() * bsz
+        total_psnr += psnr.item() * bsz
         n_samples += bsz
 
-        # update text của progress bar
-        # pbar.set_postfix({"loss": loss.item()})
+        pbar.set_postfix({"loss": loss.item(), "psnr": psnr.item()})
 
-    return total_loss / max(1, n_samples)
+    avg_loss = total_loss / max(1, n_samples)
+    avg_psnr = total_psnr / max(1, n_samples)
+    return avg_loss, avg_psnr
 
 
 @torch.no_grad()
@@ -159,9 +183,15 @@ def validate_one_epoch(
     device: str,
     epoch: int,
     num_epochs: int,
-) -> float:
+) -> Tuple[float, float]:
+    """
+    Trả về:
+      - avg_val_loss
+      - avg_val_psnr
+    """
     model.eval()
     total_loss = 0.0
+    total_psnr = 0.0
     n_samples = 0
 
     l1_loss = nn.L1Loss()
@@ -191,14 +221,19 @@ def validate_one_epoch(
             )
 
         loss = l1_loss(pred, target)
+        psnr = compute_psnr(pred, target, max_val=1.0)
 
         bsz = image.size(0)
         total_loss += loss.item() * bsz
+        total_psnr += psnr.item() * bsz
         n_samples += bsz
 
-        # pbar.set_postfix({"loss": loss.item()})
+        pbar.set_postfix({"loss": loss.item(), "psnr": psnr.item()})
 
-    return total_loss / max(1, n_samples)
+    avg_loss = total_loss / max(1, n_samples)
+    avg_psnr = total_psnr / max(1, n_samples)
+    return avg_loss, avg_psnr
+
 
 def main():
     # ========== 1. Đọc config ==========
@@ -231,13 +266,12 @@ def main():
     model, model_name = build_model(cfg_model, device)
     optimizer = build_optimizer(cfg_train, model)
 
-    # 🔥 In số lượng tham số model
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"[INFO] Model params: total={total_params:,}, trainable={trainable_params:,}")
 
     num_epochs = cfg_train.get("epochs", 50)
-    lr = float(cfg_train.get("lr", 1e-4))  
+    lr = float(cfg_train.get("lr", 1e-4))
     min_lr = float(cfg_train.get("min_lr", 1e-6))
     warmup_epochs = int(cfg_train.get("warmup_epochs", 3))
 
@@ -269,33 +303,39 @@ def main():
     save_interval = cfg_ckpt.get("save_interval", 5)
     log_interval = cfg_log.get("log_interval", 50)
 
-    # tqdm cho vòng epoch (dạng outer bar)
     for epoch in tqdm(range(start_epoch, num_epochs), desc="Epochs"):
         # train
-        train_loss = train_one_epoch(
+        train_loss, train_psnr = train_one_epoch(
             model, model_name, train_loader, optimizer, device, epoch, num_epochs
         )
+
         # val
         if val_loader is not None:
-            val_loss = validate_one_epoch(
+            val_loss, val_psnr = validate_one_epoch(
                 model, model_name, val_loader, device, epoch, num_epochs
             )
         else:
-            val_loss = float("nan")
+            val_loss, val_psnr = float("nan"), float("nan")
 
         # step scheduler
         scheduler.step()
 
-        # log ra console + file (theo header cũ trong logger.py)
-        log_line = f"{epoch},{train_loss:.6f},-,-,-,{val_loss:.6f},-,-,-"
+        # log ra file CSV-like
+        log_line = (
+            f"{epoch},"
+            f"{train_loss:.6f},{train_psnr:.4f},-,-,"
+            f"{val_loss:.6f},{val_psnr:.4f},-,-"
+        )
         logger.info(log_line)
 
+        # log ra console
         logger.info(
             f"[Epoch {epoch}/{num_epochs}] "
-            f"train_loss={train_loss:.6f} | val_loss={val_loss:.6f}"
+            f"train_loss={train_loss:.6f} | val_loss={val_loss:.6f} | "
+            f"train_psnr={train_psnr:.2f} | val_psnr={val_psnr:.2f}"
         )
 
-        # save checkpoint định kỳ
+        # save checkpoint
         is_best = (val_loader is not None) and (val_loss < best_val_loss)
         if is_best:
             best_val_loss = val_loss
@@ -310,6 +350,7 @@ def main():
             )
 
     logger.info("[INFO] Training finished.")
+
 
 if __name__ == "__main__":
     main()
