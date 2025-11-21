@@ -174,7 +174,7 @@ class EfficientNetMAT(nn.Module):
     """
     def __init__(
         self,
-        encoder_name: str = "efficientnet_b0",
+        encoder_name: str = "efficientnet_b4",
         pretrained: bool = True,
         in_channels: int = 4,
         style_dim: int = 256,

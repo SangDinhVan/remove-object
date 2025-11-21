@@ -5,9 +5,9 @@ dataset:
   binary_mask: true              
 
 model:
-  name: "efficientnet_unet"       
+  name: "efficientnet_mat"       
   in_channels: 4                   # RGB + mask
-  encoder_name: "efficientnet_b0"  # b0/b1/b2/b3... tùy bạn
+  encoder_name: "efficientnet_b4"  # b0/b1/b2/b3... tùy bạn
   pretrained: true                 # load pretrained EfficientNet
 
   # MAT model only:

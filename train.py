@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader, random_split
 from preprocessing.dataset import InpaintDataset                 # chỉnh lại path nếu cần
 from model.efficientnet_unet import EfficientNetUNet
 from model.efficientnet_mat import EfficientNetMAT
+from torchvision import models
 
 from utils.checkpoints import save_checkpoint, load_checkpoint
 from utils.logger import setup_logger
@@ -28,6 +29,57 @@ def compute_psnr(pred: torch.Tensor, target: torch.Tensor, max_val: float = 1.0)
     mse = F.mse_loss(pred, target, reduction="mean")
     psnr = 10 * torch.log10(max_val ** 2 / (mse + 1e-8))
     return psnr
+
+
+# =========================
+#   PERCEPTUAL LOSS (VGG19)
+# =========================
+class VGGPerceptualLoss(nn.Module):
+    """
+    Dùng feature VGG19 (pretrained ImageNet) để tính perceptual loss.
+    Ở đây lấy 2 tầng: relu3_3 và relu4_3 (chỉ là ví dụ hợp lý).
+    """
+    def __init__(self):
+        super().__init__()
+        vgg = models.vgg19(pretrained=True).features
+
+        # slice: [0..16] ~ lên tới relu3_3, [16..25] ~ lên tới relu4_3
+        self.slice1 = nn.Sequential(*[vgg[i] for i in range(16)])
+        self.slice2 = nn.Sequential(*[vgg[i] for i in range(16, 25)])
+
+        # không cho VGG update khi train
+        for p in self.parameters():
+            p.requires_grad = False
+
+        # chuẩn hóa theo ImageNet
+        self.register_buffer(
+            "mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+        )
+        self.register_buffer(
+            "std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+        )
+
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean) / self.std
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        x, y: [B,3,H,W] trong [0,1]
+        trả về tổng L1 giữa feature map 2 tầng
+        """
+        x = self._norm(x)
+        y = self._norm(y)
+
+        fx1 = self.slice1(x)
+        fy1 = self.slice1(y)
+        fx2 = self.slice2(fx1)
+        fy2 = self.slice2(fy1)
+
+        loss1 = torch.mean(torch.abs(fx1 - fy1))
+        loss2 = torch.mean(torch.abs(fx2 - fy2))
+        return loss1 + loss2
 
 
 def build_dataloaders(cfg_dataset: dict, cfg_train: dict):
@@ -108,6 +160,53 @@ def build_optimizer(cfg_train: dict, model: nn.Module):
     return optimizer
 
 
+def compute_inpaint_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    l1_loss: nn.L1Loss,
+    rec_weight: float,
+    hole_weight: float,
+    valid_weight: float,
+    perc_weight: float,
+    perceptual_loss: nn.Module = None,
+) -> torch.Tensor:
+    """
+    Tính loss tổng:
+      - L1 vùng hole (mask = 1) với hệ số hole_weight
+      - L1 vùng valid (mask = 0) với hệ số valid_weight
+      - nhân rec_weight cho toàn bộ L1
+      - cộng thêm perceptual_loss * perc_weight (nếu có)
+    """
+    eps = 1e-6
+
+    # L1 per-pixel: [B,3,H,W]
+    l1_map = l1_loss(pred, target)
+
+    # mask: [B,1,H,W] -> broadcast sang 3 channel
+    if mask.shape[1] == 1 and l1_map.shape[1] != 1:
+        hole_mask = mask.expand(-1, l1_map.shape[1], -1, -1)
+    else:
+        hole_mask = mask
+
+    valid_mask = 1.0 - hole_mask
+
+    # mean L1 trên từng vùng
+    hole_loss = (l1_map * hole_mask).sum() / (hole_mask.sum() + eps)
+    valid_loss = (l1_map * valid_mask).sum() / (valid_mask.sum() + eps)
+
+    rec_l1 = hole_weight * hole_loss + valid_weight * valid_loss
+    rec_l1 = rec_weight * rec_l1
+
+    total_loss = rec_l1
+
+    if perc_weight > 0.0 and perceptual_loss is not None:
+        perc = perceptual_loss(pred, target)
+        total_loss = total_loss + perc_weight * perc
+
+    return total_loss
+
+
 def train_one_epoch(
     model: nn.Module,
     model_name: str,
@@ -116,6 +215,12 @@ def train_one_epoch(
     device: str,
     epoch: int,
     num_epochs: int,
+    l1_loss: nn.L1Loss,
+    rec_weight: float,
+    hole_weight: float,
+    valid_weight: float,
+    perc_weight: float,
+    perceptual_loss: nn.Module = None,
 ) -> Tuple[float, float]:
     """
     Trả về:
@@ -126,8 +231,6 @@ def train_one_epoch(
     total_loss = 0.0
     total_psnr = 0.0
     n_samples = 0
-
-    l1_loss = nn.L1Loss()
 
     pbar = tqdm(loader, desc=f"Train Epoch {epoch+1}/{num_epochs}", leave=False)
     for batch in pbar:
@@ -155,7 +258,19 @@ def train_one_epoch(
                 align_corners=False,
             )
 
-        loss = l1_loss(pred, target)
+        # ----- loss mới: hole/valid + perceptual -----
+        loss = compute_inpaint_loss(
+            pred=pred,
+            target=target,
+            mask=mask,
+            l1_loss=l1_loss,
+            rec_weight=rec_weight,
+            hole_weight=hole_weight,
+            valid_weight=valid_weight,
+            perc_weight=perc_weight,
+            perceptual_loss=perceptual_loss,
+        )
+
         loss.backward()
         optimizer.step()
 
@@ -183,6 +298,12 @@ def validate_one_epoch(
     device: str,
     epoch: int,
     num_epochs: int,
+    l1_loss: nn.L1Loss,
+    rec_weight: float,
+    hole_weight: float,
+    valid_weight: float,
+    perc_weight: float,
+    perceptual_loss: nn.Module = None,
 ) -> Tuple[float, float]:
     """
     Trả về:
@@ -193,8 +314,6 @@ def validate_one_epoch(
     total_loss = 0.0
     total_psnr = 0.0
     n_samples = 0
-
-    l1_loss = nn.L1Loss()
 
     pbar = tqdm(loader, desc=f"Val   Epoch {epoch+1}/{num_epochs}", leave=False)
     for batch in pbar:
@@ -220,7 +339,19 @@ def validate_one_epoch(
                 align_corners=False,
             )
 
-        loss = l1_loss(pred, target)
+        # dùng cùng loss như train (nhưng không backward)
+        loss = compute_inpaint_loss(
+            pred=pred,
+            target=target,
+            mask=mask,
+            l1_loss=l1_loss,
+            rec_weight=rec_weight,
+            hole_weight=hole_weight,
+            valid_weight=valid_weight,
+            perc_weight=perc_weight,
+            perceptual_loss=perceptual_loss,
+        )
+
         psnr = compute_psnr(pred, target, max_val=1.0)
 
         bsz = image.size(0)
@@ -246,6 +377,7 @@ def main():
     cfg_train = cfg["train"]
     cfg_ckpt = cfg.get("checkpoint", {})
     cfg_log = cfg.get("logging", {})
+    cfg_loss = cfg.get("loss", {})
 
     device = cfg_train.get("device", "cuda" if torch.cuda.is_available() else "cpu")
 
@@ -265,6 +397,23 @@ def main():
     # ========== 4. Model & Optimizer & Scheduler ==========
     model, model_name = build_model(cfg_model, device)
     optimizer = build_optimizer(cfg_train, model)
+
+    # ----- Loss setup -----
+    rec_weight   = float(cfg_loss.get("rec_weight", 1.0))          # tổng rec L1
+    perc_weight  = float(cfg_loss.get("perceptual_weight", 0.0))   # >0 thì bật perceptual
+    hole_weight  = float(cfg_loss.get("hole_weight", 6.0))         # vùng mask
+    valid_weight = float(cfg_loss.get("valid_weight", 1.0))        # vùng không mask
+
+    # L1 per-pixel để tự tính mask
+    l1_loss = nn.L1Loss(reduction="none")
+
+    perceptual_loss = None
+    if perc_weight > 0:
+        perceptual_loss = VGGPerceptualLoss().to(device)
+        perceptual_loss.eval()
+        logger.info("[INFO] Using VGG19 perceptual loss")
+    else:
+        logger.info("[INFO] No perceptual loss (perceptual_weight=0)")
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -301,18 +450,41 @@ def main():
 
     # ========== 6. Training loop ==========
     save_interval = cfg_ckpt.get("save_interval", 5)
-    log_interval = cfg_log.get("log_interval", 50)
+    log_interval = cfg_log.get("log_interval", 50)  # hiện tại chưa dùng, giữ lại nếu cần
 
     for epoch in tqdm(range(start_epoch, num_epochs), desc="Epochs"):
         # train
         train_loss, train_psnr = train_one_epoch(
-            model, model_name, train_loader, optimizer, device, epoch, num_epochs
+            model=model,
+            model_name=model_name,
+            loader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            epoch=epoch,
+            num_epochs=num_epochs,
+            l1_loss=l1_loss,
+            rec_weight=rec_weight,
+            hole_weight=hole_weight,
+            valid_weight=valid_weight,
+            perc_weight=perc_weight,
+            perceptual_loss=perceptual_loss,
         )
 
         # val
         if val_loader is not None:
             val_loss, val_psnr = validate_one_epoch(
-                model, model_name, val_loader, device, epoch, num_epochs
+                model=model,
+                model_name=model_name,
+                loader=val_loader,
+                device=device,
+                epoch=epoch,
+                num_epochs=num_epochs,
+                l1_loss=l1_loss,
+                rec_weight=rec_weight,
+                hole_weight=hole_weight,
+                valid_weight=valid_weight,
+                perc_weight=perc_weight,
+                perceptual_loss=perceptual_loss,
             )
         else:
             val_loss, val_psnr = float("nan"), float("nan")
