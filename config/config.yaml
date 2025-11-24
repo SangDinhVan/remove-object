@@ -1,0 +1,54 @@
+dataset:
+  root_dir: "data"               
+  image_size: 512              
+  extensions: [".jpg", ".jpeg", ".png"]
+  binary_mask: true              
+
+model:
+  name: "efficientnet_mat"       
+  in_channels: 4                   # RGB + mask
+  encoder_name: "resnet50"  # b0/b1/b2/b3... tùy bạn
+  pretrained: true                 # load pretrained EfficientNet
+
+  # MAT model only:
+  mat:
+    num_layers: 4                 # số block Transformer
+    n_heads: 8                    # multi-head
+    d_ff: 3072                                        # hidden size trong FFN
+    use_mask_attn: false          # nếu true thì MAT dùng mask làm attn bias
+
+train:
+  batch_size: 8
+  num_workers: 4
+  epochs: 50
+  lr: 1e-4
+  weight_decay: 0.0
+  device: "cuda"
+
+loss:
+  l1_weight: 1.0
+  perceptual_weight: 0.0           # tăng lên 0.1 nếu muốn dùng perceptual loss
+  ssim_weight: 0.0                 # dùng SSIM loss
+
+optimizer:
+  type: "adam"                     # adam / adamw
+  betas: [0.9, 0.999]
+
+scheduler:
+  type: "none"                     # cosine / step / none
+  cosine:
+    T_max: 50
+  step:
+    step_size: 20
+    gamma: 0.5
+
+checkpoint:
+  save_dir: "checkpoints"
+  save_interval: 5
+  resume: ""                       # path checkpoint để resume
+
+logging:
+  log_interval: 20                # in log mỗi N batch
+  save_samples: true              # lưu sample image mỗi epoch
+  sample_dir: "samples"
+
