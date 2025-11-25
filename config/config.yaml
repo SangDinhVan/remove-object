@@ -5,17 +5,20 @@ dataset:
   binary_mask: true              
 
 model:
-  name: "efficientnet_mat"       
+  name: "mat_lama_net"       
   in_channels: 4                   # RGB + mask
   encoder_name: "resnet50"  # b0/b1/b2/b3... tùy bạn
   pretrained: true                 # load pretrained EfficientNet
 
   # MAT model only:
   mat:
+    style_dim: 256
+    n_heads: 8
+    d_ff: 2048
+    num_layers: 4
+    dropout: 0.0
     bottleneck_dim: 512
-    num_layers: 4                 # số block Transformer
-    n_heads: 8                    # multi-head
-    d_ff: 3072                                        # hidden size trong FFN
+    smm_hidden: 25                                     # hidden size trong FFN
     use_mask_attn: false          # nếu true thì MAT dùng mask làm attn bias
 
 train:
@@ -23,18 +26,20 @@ train:
   num_workers: 4
   epochs: 50
   lr: 1e-4
+  lr_D: 1e-4
   weight_decay: 0.0
   device: "cuda"
+  warmup_epochs: 3
+  min_lr: 1e-
 
 loss:
-  use_gan: true          # bật GAN theo paper
-  rec_weight: 0.0        # =0 nếu muốn đúng bài (không dùng L1)
-  perceptual_weight: 0.1 # lambda_P trong paper
+  rec_weight: 1.0
   hole_weight: 6.0
   valid_weight: 1.0
-  r1_gamma: 10.0         # theo paper
-  d_lr: 1e-4             # lr cho D (tuỳ GPU)
-                # dùng SSIM loss
+  perceptual_weight: 0.1   # nếu muốn dùng perceptual
+  gan_weight: 0.1          # bật GAN
+  r1_gamma: 10.0
+           
 
 optimizer:
   type: "adam"                     # adam / adamw
