@@ -27,9 +27,14 @@ train:
   device: "cuda"
 
 loss:
-  l1_weight: 1.0
-  perceptual_weight: 0.0           # tăng lên 0.1 nếu muốn dùng perceptual loss
-  ssim_weight: 0.0                 # dùng SSIM loss
+  use_gan: true          # bật GAN theo paper
+  rec_weight: 0.0        # =0 nếu muốn đúng bài (không dùng L1)
+  perceptual_weight: 0.1 # lambda_P trong paper
+  hole_weight: 6.0
+  valid_weight: 1.0
+  r1_gamma: 10.0         # theo paper
+  d_lr: 1e-4             # lr cho D (tuỳ GPU)
+                # dùng SSIM loss
 
 optimizer:
   type: "adam"                     # adam / adamw

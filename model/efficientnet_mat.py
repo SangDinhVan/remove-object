@@ -11,7 +11,7 @@ import timm
 class ConvBlock(nn.Module):
     """
     2 x (Conv2d + BN + GELU)
-    Dùng lại cho bridge / decoder.
+    Dùng cho bridge / decoder.
     """
     def __init__(self, in_ch, out_ch):
         super().__init__()
@@ -46,27 +46,26 @@ class UpBlock(nn.Module):
 
 
 # ==========================
-#   STYLE MANIPULATION (SMM)
+#   STYLE MANIPULATION LITE
 # ==========================
 
 class StyleManipulationModule(nn.Module):
     """
-    SMM: lấy style vector z -> sinh gamma, beta để FiLM (scale + shift)
-    vào token features của Transformer.
-
-    z: [B, style_dim]
-    gamma, beta: [B, d_model]
+    SMM-lite: z -> (gamma, beta) để FiLM token features.
+    MLP nhỏ để giảm số tham số:
+        style_dim -> hidden -> 2*d_model
     """
-    def __init__(self, style_dim, d_model):
+    def __init__(self, style_dim, d_model, hidden_dim=256):
         super().__init__()
         self.fc = nn.Sequential(
-            nn.Linear(style_dim, d_model * 2),
+            nn.Linear(style_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(d_model * 2, d_model * 2),
+            nn.Linear(hidden_dim, 2 * d_model),
         )
 
     def forward(self, z):
         """
+        z: [B, style_dim]
         return:
             gamma, beta: [B, d_model]
         """
@@ -77,18 +76,19 @@ class StyleManipulationModule(nn.Module):
 
 class StyleTransformerBlock(nn.Module):
     """
-    Transformer block đã được 'điều chỉnh' bởi style (SMM):
+    Transformer block + style FiLM (MAT-lite):
 
-    - LayerNorm
-    - FiLM: x = x * (1 + gamma) + beta (theo style)
-    - Multi-head Self-Attention
-    - Residual
-    - FFN (2-layer MLP với GELU) + style modulation lần nữa
+    - LN
+    - SMM-lite: x = x * (1 + gamma) + beta
+    - Multi-head Self-Attention + residual
+    - LN
+    - SMM-lite
+    - FFN + residual
 
     x_seq: [B, N, C]
     z: [B, style_dim]
     """
-    def __init__(self, d_model, n_heads, d_ff, style_dim, dropout=0.0):
+    def __init__(self, d_model, n_heads, d_ff, style_dim, dropout=0.0, smm_hidden=256):
         super().__init__()
         self.d_model = d_model
 
@@ -108,9 +108,9 @@ class StyleTransformerBlock(nn.Module):
             nn.Linear(d_ff, d_model),
         )
 
-        # 2 SMM: một cho trước attention, một cho trước FFN
-        self.smm1 = StyleManipulationModule(style_dim, d_model)
-        self.smm2 = StyleManipulationModule(style_dim, d_model)
+        # 2 SMM-lite: một cho trước attention, một cho trước FFN
+        self.smm1 = StyleManipulationModule(style_dim, d_model, hidden_dim=smm_hidden)
+        self.smm2 = StyleManipulationModule(style_dim, d_model, hidden_dim=smm_hidden)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -119,32 +119,28 @@ class StyleTransformerBlock(nn.Module):
         x_seq: [B, N, C]
         z: [B, style_dim]
         """
-        B, N, C = x_seq.shape
-
         # ---- Block 1: LN -> Style FiLM -> Self-Attention ----
-        h = self.ln1(x_seq)
+        h = self.ln1(x_seq)                      # [B,N,C]
 
-        gamma1, beta1 = self.smm1(z)       # [B, C]
-        gamma1 = gamma1.unsqueeze(1)       # [B,1,C]
-        beta1  = beta1.unsqueeze(1)        # [B,1,C]
-
-        h = h * (1.0 + gamma1) + beta1     # style modulation
+        gamma1, beta1 = self.smm1(z)             # [B,C]
+        gamma1 = gamma1.unsqueeze(1)             # [B,1,C]
+        beta1  = beta1.unsqueeze(1)              # [B,1,C]
+        h = h * (1.0 + gamma1) + beta1           # FiLM
 
         attn_out, _ = self.self_attn(
             h, h, h,
             attn_mask=attn_mask,
             key_padding_mask=key_padding_mask,
             need_weights=False,
-        )
-        x_seq = x_seq + self.dropout(attn_out)
+        )                                         # [B,N,C]
+        x_seq = x_seq + self.dropout(attn_out)   # residual
 
         # ---- Block 2: LN -> Style FiLM -> FFN ----
         h2 = self.ln2(x_seq)
 
-        gamma2, beta2 = self.smm2(z)       # [B, C]
+        gamma2, beta2 = self.smm2(z)             # [B,C]
         gamma2 = gamma2.unsqueeze(1)
         beta2  = beta2.unsqueeze(1)
-
         h2 = h2 * (1.0 + gamma2) + beta2
 
         ffn_out = self.ffn(h2)
@@ -153,8 +149,25 @@ class StyleTransformerBlock(nn.Module):
         return x_seq
 
 
-#   EFFICIENTNET + MAT
+# ==========================
+#   EFFICIENTNET / RESNET + MAT-LITE
+# ==========================
+
 class EfficientNetMAT(nn.Module):
+    """
+    MAT-lite cho inpainting / remove object:
+
+    - Encoder: EfficientNet/ResNet từ timm (features_only)
+    - Bottleneck: down-project C5 -> bottleneck_dim,
+                  + mask embedding, + stack StyleTransformerBlock
+    - Decoder: U-Net style (skip f1..f4)
+    - Input:
+        x    = concat(masked_image, mask)  -> [B, 4, H, W]
+        mask = [B, 1, H, W]
+        z    = [B, style_dim] (noise / style vector)
+    - Output:
+        [B, 3, H, W] trong [0,1]
+    """
 
     def __init__(
         self,
@@ -166,31 +179,38 @@ class EfficientNetMAT(nn.Module):
         d_ff: int = 2048,
         num_layers: int = 4,
         dropout: float = 0.0,
-        bottleneck_dim: int = 512, 
+        bottleneck_dim: int = 512,
+        smm_hidden: int = 256,
     ):
         super().__init__()
 
         self.pretrained = pretrained
         self.style_dim = style_dim
         self.bottleneck_dim = bottleneck_dim
-        # 4 kênh (RGB + mask) -> 3 kênh cho EfficientNet
+
+        # 4 kênh (RGB + mask) -> 3 kênh cho encoder
         self.input_proj = nn.Conv2d(in_channels, 3, kernel_size=1)
 
-        # Encoder EfficientNet
+        # ----- Encoder từ timm -----
         self.encoder = timm.create_model(
             encoder_name,
             pretrained=pretrained,
             features_only=True,
             out_indices=(0, 1, 2, 3, 4),
         )
-        enc_channels = self.encoder.feature_info.channels()
+        enc_channels = self.encoder.feature_info.channels()  # [c1..c5]
         c1, c2, c3, c4, c5 = enc_channels
 
         d_model = self.bottleneck_dim
+
+        # Bottleneck: giảm C5 -> d_model, rồi tăng d_model -> C5
         self.bottleneck_down = nn.Conv2d(c5, d_model, kernel_size=1)
         self.bottleneck_up   = nn.Conv2d(d_model, c5, kernel_size=1)
+
+        # Mask embedding: 1 -> d_model
         self.mask_embed = nn.Conv2d(1, d_model, kernel_size=1)
 
+        # Stack các StyleTransformerBlock
         self.transformer_blocks = nn.ModuleList([
             StyleTransformerBlock(
                 d_model=d_model,
@@ -198,14 +218,15 @@ class EfficientNetMAT(nn.Module):
                 d_ff=d_ff,
                 style_dim=style_dim,
                 dropout=dropout,
+                smm_hidden=smm_hidden,
             )
             for _ in range(num_layers)
         ])
 
-        # Bridge conv sau transformer
+        # Bridge conv sau transformer (C5 -> C5)
         self.bridge = ConvBlock(c5, c5)
 
-        # Decoder (UNet)
+        # Decoder U-Net
         self.up4 = UpBlock(c5, c4, 256)
         self.up3 = UpBlock(256, c3, 128)
         self.up2 = UpBlock(128, c2, 64)
@@ -213,11 +234,11 @@ class EfficientNetMAT(nn.Module):
 
         self.out_conv = nn.Conv2d(32, 3, kernel_size=1)
 
-        # init
+        # ============= INIT =============
         self._init_backbone(self.input_proj)
         self._init_backbone(self.mask_embed)
-        self._init_backbone(self.bottleneck_down)   
-        self._init_backbone(self.bottleneck_up) 
+        self._init_backbone(self.bottleneck_down)
+        self._init_backbone(self.bottleneck_up)
         self._init_backbone(self.bridge)
         self._init_backbone(self.up4)
         self._init_backbone(self.up3)
@@ -228,16 +249,20 @@ class EfficientNetMAT(nn.Module):
         for blk in self.transformer_blocks:
             self._init_backbone(blk)
 
-        # nếu KHÔNG dùng pretrained thì mới init encoder
         if not self.pretrained:
             self._init_backbone(self.encoder)
 
-        # init cho các module đặc biệt (LSTM/attn/fc nếu có)
-        self._init_weights()
+        self._init_weights_special()
 
     # ---------- factory từ config dict ----------
     @classmethod
     def from_config(cls, cfg: dict):
+        """
+        cfg:
+          encoder_name, pretrained, in_channels
+          mat:
+            style_dim, n_heads, d_ff, num_layers, dropout, bottleneck_dim, smm_hidden
+        """
         mat_cfg = cfg.get("mat", {})
         return cls(
             encoder_name=cfg.get("encoder_name", "efficientnet_b0"),
@@ -249,6 +274,7 @@ class EfficientNetMAT(nn.Module):
             num_layers=mat_cfg.get("num_layers", 4),
             dropout=mat_cfg.get("dropout", 0.0),
             bottleneck_dim=mat_cfg.get("bottleneck_dim", 512),
+            smm_hidden=mat_cfg.get("smm_hidden", 256),
         )
 
     # ---------- init backbone (Conv/BN/Linear) ----------
@@ -258,40 +284,26 @@ class EfficientNetMAT(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
-
             elif isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    # ---------- init cho LSTM / attn / fc (dạng generic) ----------
-    def _init_weights(self):
-        if hasattr(self, "attn"):
-            if hasattr(self.attn, "weight") and self.attn.weight is not None:
-                nn.init.xavier_uniform_(self.attn.weight)
-            if hasattr(self.attn, "bias") and self.attn.bias is not None:
-                nn.init.constant_(self.attn.bias, 0)
-
-        # Fully-connected head (nếu có self.fc)
-        if hasattr(self, "fc"):
-            for m in self.fc.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight)
-                    if m.bias is not None:
-                        nn.init.constant_(m.bias, 0)
+    def _init_weights_special(self):
+        # chừa sẵn nếu sau này bạn add LSTM/attn/FC đặc biệt
+        pass
 
     # ---------- forward ----------
     def forward(self, x: torch.Tensor, mask: torch.Tensor, z: torch.Tensor):
         """
         x   : [B, 4, H, W]  (masked_image concat mask)
-        mask: [B, 1, H, W]  (mask gốc)
+        mask: [B, 1, H, W]  (mask gốc, 1 = vùng cần inpaint)
         z   : [B, style_dim] (noise / style)
 
-        return: [B, 3, H, W]
+        return: [B, 3, H, W] trong [0,1]
         """
         B, _, H, W = x.shape
 
@@ -300,44 +312,51 @@ class EfficientNetMAT(nn.Module):
 
         # encoder features
         feats = self.encoder(x_in)
-        f1, f2, f3, f4, f5 = feats    # f5: [B, C5, Hb, Wb]
+        f1, f2, f3, f4, f5 = feats        # f5: [B,C5,Hb,Wb]
         B, C5, Hb, Wb = f5.shape
 
         # ----- mask embedding -----
         mask_ds = F.interpolate(mask, size=(Hb, Wb), mode="nearest")  # [B,1,Hb,Wb]
-        mask_emb = self.mask_embed(mask_ds)                           # [B, d_model, Hb, Wb]
+        mask_emb = self.mask_embed(mask_ds)                           # [B,d_model,Hb,Wb]
 
-        # ----- đưa f5 về d_model (vd 512) -----
-        f5_down = self.bottleneck_down(f5)                            # [B, d_model, Hb, Wb]
+        # ----- đưa f5 về d_model -----
+        f5_down = self.bottleneck_down(f5)                            # [B,d_model,Hb,Wb]
 
         # combine feature + mask info trong không gian d_model
-        feat = f5_down + mask_emb                                     # [B, d_model, Hb, Wb]
+        feat = f5_down + mask_emb                                     # [B,d_model,Hb,Wb]
 
         # flatten -> [B, N, d_model]
-        x_seq = feat.flatten(2).transpose(1, 2)                       # [B, N, d_model]
+        x_seq = feat.flatten(2).transpose(1, 2)                       # [B,N,d_model]
 
-        # transformer bottleneck
+        # (optional) có thể thêm key_padding_mask từ mask_ds nếu muốn
+        key_padding_mask = None
+        attn_mask = None
+
+        # ----- transformer bottleneck -----
         for blk in self.transformer_blocks:
-            x_seq = blk(x_seq, z)  # [B, N, d_model]
+            x_seq = blk(x_seq, z, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
 
         # reshape lại về feature map d_model
         x_trans_bottleneck = x_seq.transpose(1, 2).view(
             B, self.bottleneck_dim, Hb, Wb
-        )  # [B, d_model, Hb, Wb]
+        )  # [B,d_model,Hb,Wb]
 
         # đưa ngược về C5 để feed vào bridge + decoder
-        x_trans = self.bottleneck_up(x_trans_bottleneck)              # [B, C5, Hb, Wb]
+        x_trans = self.bottleneck_up(x_trans_bottleneck)              # [B,C5,Hb,Wb]
 
         # bridge conv
-        x_bridge = self.bridge(x_trans)
+        x_bridge = self.bridge(x_trans)                               # [B,C5,Hb,Wb]
 
-
+        # decoder UNet
         x = self.up4(x_bridge, f4)
         x = self.up3(x, f3)
         x = self.up2(x, f2)
         x = self.up1(x, f1)
+
+        # resize về H,W gốc nếu lệch
         if x.shape[-2:] != (H, W):
             x = F.interpolate(x, size=(H, W), mode="bilinear", align_corners=False)
+
         out = self.out_conv(x)
         out = torch.sigmoid(out)
         return out
@@ -355,11 +374,12 @@ if __name__ == "__main__":
         in_channels=4,
         style_dim=256,
         n_heads=8,
-        d_ff=3072,
+        d_ff=2048,
         num_layers=4,
         bottleneck_dim=512,
+        smm_hidden=256,
     )
-    
+
     # ==== IN RA SỐ PARAM ====
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -374,4 +394,3 @@ if __name__ == "__main__":
 
     y = model(masked_plus_mask, mask, z)
     print("Output shape:", y.shape)  # expect [B, 3, 512, 512]
-
