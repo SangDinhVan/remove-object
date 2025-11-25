@@ -153,25 +153,9 @@ class StyleTransformerBlock(nn.Module):
         return x_seq
 
 
-# ==========================
 #   EFFICIENTNET + MAT
-# ==========================
-
 class EfficientNetMAT(nn.Module):
-    """
-    Inpainting model dạng MAT:
 
-    - Encoder: EfficientNet (pretrained)
-    - Bottleneck: stack StyleTransformerBlock (SMM + self-attn + FFN)
-      kết hợp feature f5 + mask embedding + style z
-    - Decoder: U-Net style
-    - Input:
-        x    = concat(masked_image, mask)  -> [B, 4, H, W]
-        mask = [B, 1, H, W]
-        z    = [B, style_dim] (noise / style vector)
-    - Output:
-        [B, 3, H, W] trong [0,1]
-    """
     def __init__(
         self,
         encoder_name: str = "efficientnet_b0",
@@ -182,12 +166,13 @@ class EfficientNetMAT(nn.Module):
         d_ff: int = 2048,
         num_layers: int = 4,
         dropout: float = 0.0,
+        bottleneck_dim: int = 512, 
     ):
         super().__init__()
 
         self.pretrained = pretrained
         self.style_dim = style_dim
-
+        self.bottleneck_dim = bottleneck_dim
         # 4 kênh (RGB + mask) -> 3 kênh cho EfficientNet
         self.input_proj = nn.Conv2d(in_channels, 3, kernel_size=1)
 
@@ -201,12 +186,11 @@ class EfficientNetMAT(nn.Module):
         enc_channels = self.encoder.feature_info.channels()
         c1, c2, c3, c4, c5 = enc_channels
 
-        d_model = c5  # dùng C của feature f5 làm dim transformer
-
-        # Mask embedding: downsample mask -> Hb x Wb rồi map -> C
+        d_model = self.bottleneck_dim
+        self.bottleneck_down = nn.Conv2d(c5, d_model, kernel_size=1)
+        self.bottleneck_up   = nn.Conv2d(d_model, c5, kernel_size=1)
         self.mask_embed = nn.Conv2d(1, d_model, kernel_size=1)
 
-        # Stack các StyleTransformerBlock (T1..Tn trong hình)
         self.transformer_blocks = nn.ModuleList([
             StyleTransformerBlock(
                 d_model=d_model,
@@ -229,11 +213,11 @@ class EfficientNetMAT(nn.Module):
 
         self.out_conv = nn.Conv2d(32, 3, kernel_size=1)
 
-        # ============= INIT =============
-
-        # init module mình thêm
+        # init
         self._init_backbone(self.input_proj)
         self._init_backbone(self.mask_embed)
+        self._init_backbone(self.bottleneck_down)   
+        self._init_backbone(self.bottleneck_up) 
         self._init_backbone(self.bridge)
         self._init_backbone(self.up4)
         self._init_backbone(self.up3)
@@ -264,6 +248,7 @@ class EfficientNetMAT(nn.Module):
             d_ff=mat_cfg.get("d_ff", 2048),
             num_layers=mat_cfg.get("num_layers", 4),
             dropout=mat_cfg.get("dropout", 0.0),
+            bottleneck_dim=mat_cfg.get("bottleneck_dim", 512),
         )
 
     # ---------- init backbone (Conv/BN/Linear) ----------
@@ -285,17 +270,6 @@ class EfficientNetMAT(nn.Module):
 
     # ---------- init cho LSTM / attn / fc (dạng generic) ----------
     def _init_weights(self):
-        # LSTM (nếu bạn add thêm)
-        if hasattr(self, "lstm"):
-            for name, param in self.lstm.named_parameters():
-                if "weight_ih" in name:
-                    nn.init.xavier_uniform_(param)
-                elif "weight_hh" in name:
-                    nn.init.orthogonal_(param)
-                elif "bias" in name:
-                    nn.init.constant_(param, 0)
-
-        # Attention linear (nếu có self.attn)
         if hasattr(self, "attn"):
             if hasattr(self.attn, "weight") and self.attn.weight is not None:
                 nn.init.xavier_uniform_(self.attn.weight)
@@ -326,33 +300,38 @@ class EfficientNetMAT(nn.Module):
 
         # encoder features
         feats = self.encoder(x_in)
-        f1, f2, f3, f4, f5 = feats    # f5: [B,C,Hb,Wb]
-        B, C, Hb, Wb = f5.shape
+        f1, f2, f3, f4, f5 = feats    # f5: [B, C5, Hb, Wb]
+        B, C5, Hb, Wb = f5.shape
 
         # ----- mask embedding -----
         mask_ds = F.interpolate(mask, size=(Hb, Wb), mode="nearest")  # [B,1,Hb,Wb]
-        mask_emb = self.mask_embed(mask_ds)                           # [B,C,Hb,Wb]
+        mask_emb = self.mask_embed(mask_ds)                           # [B, d_model, Hb, Wb]
 
-        # combine feature + mask info
-        feat = f5 + mask_emb                                         # [B,C,Hb,Wb]
+        # ----- đưa f5 về d_model (vd 512) -----
+        f5_down = self.bottleneck_down(f5)                            # [B, d_model, Hb, Wb]
 
-        # flatten -> [B, N, C]
-        x_seq = feat.flatten(2).transpose(1, 2)                      # [B, N, C]
+        # combine feature + mask info trong không gian d_model
+        feat = f5_down + mask_emb                                     # [B, d_model, Hb, Wb]
 
-        # (optional) key_padding_mask từ mask nếu muốn:
-        # hiện tại bỏ qua cho đơn giản; bạn có thể thêm theo paper.
+        # flatten -> [B, N, d_model]
+        x_seq = feat.flatten(2).transpose(1, 2)                       # [B, N, d_model]
 
-        # ----- stack style-aware transformer blocks -----
+        # transformer bottleneck
         for blk in self.transformer_blocks:
-            x_seq = blk(x_seq, z)  # [B, N, C]
+            x_seq = blk(x_seq, z)  # [B, N, d_model]
 
-        # reshape lại về feature map
-        x_trans = x_seq.transpose(1, 2).view(B, C, Hb, Wb)
+        # reshape lại về feature map d_model
+        x_trans_bottleneck = x_seq.transpose(1, 2).view(
+            B, self.bottleneck_dim, Hb, Wb
+        )  # [B, d_model, Hb, Wb]
+
+        # đưa ngược về C5 để feed vào bridge + decoder
+        x_trans = self.bottleneck_up(x_trans_bottleneck)              # [B, C5, Hb, Wb]
 
         # bridge conv
         x_bridge = self.bridge(x_trans)
 
-        # decoder UNet
+
         x = self.up4(x_bridge, f4)
         x = self.up3(x, f3)
         x = self.up2(x, f2)
@@ -371,17 +350,28 @@ class EfficientNetMAT(nn.Module):
 if __name__ == "__main__":
     B, H, W = 2, 512, 512
     model = EfficientNetMAT(
-        encoder_name="efficientnet_b0",
+        encoder_name="resnet50",
         pretrained=True,
         in_channels=4,
         style_dim=256,
         n_heads=8,
-        d_ff=2048,
+        d_ff=3072,
         num_layers=4,
+        bottleneck_dim=512,
     )
+    
+    # ==== IN RA SỐ PARAM ====
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print("Total params:", f"{total:,}")
+    print("Trainable params:", f"{trainable:,}")
+    print()
+
+    # ==== TEST FORWARD ====
     masked_plus_mask = torch.randn(B, 4, H, W)
     mask = torch.randint(0, 2, (B, 1, H, W)).float()
     z = torch.randn(B, 256)
 
     y = model(masked_plus_mask, mask, z)
     print("Output shape:", y.shape)  # expect [B, 3, 512, 512]
+

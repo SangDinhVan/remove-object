@@ -230,3 +230,10 @@ if __name__ == "__main__":
     x = torch.randn(2, 4, 512, 512)  # batch 2, masked_image+mask
     y = model(x)
     print("Output shape:", y.shape)  # expect: [2, 3, 512, 512]
+
+
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print("Total params:", f"{total:,}")
+    print("Trainable params:", f"{trainable:,}")
+    print()

@@ -12,6 +12,7 @@ model:
 
   # MAT model only:
   mat:
+    bottleneck_dim: 512
     num_layers: 4                 # số block Transformer
     n_heads: 8                    # multi-head
     d_ff: 3072                                        # hidden size trong FFN
