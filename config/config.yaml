@@ -30,7 +30,7 @@ train:
   weight_decay: 0.0
   device: "cuda"
   warmup_epochs: 3
-  min_lr: 1e-
+  min_lr: 1e-6
 
 loss:
   rec_weight: 1.0

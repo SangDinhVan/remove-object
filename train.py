@@ -413,12 +413,14 @@ def main():
     # ----- Discriminator -----
     if use_gan:
         D = PatchDiscriminator(in_ch=3).to(device)
-        opt_D = torch.optim.Adam(D.parameters(), lr=cfg_train.get("lr_D", lr), betas=(0.0, 0.9))
-        logger.info("[INFO] Using PatchGAN discriminator")
+        lr_D = float(cfg_train.get("lr_D", lr))   # ÉP KIỂU Ở ĐÂY
+        opt_D = torch.optim.Adam(D.parameters(), lr=lr_D, betas=(0.0, 0.9))
+        logger.info(f"[INFO] Using PatchGAN discriminator, lr_D={lr_D}")
     else:
         D = None
         opt_D = None
         logger.info("[INFO] GAN disabled (gan_weight=0)")
+
 
     # 5. Checkpoint
     save_dir = cfg_ckpt.get("save_dir", "checkpoints")
